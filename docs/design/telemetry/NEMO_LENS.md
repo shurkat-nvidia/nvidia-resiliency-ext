@@ -120,7 +120,7 @@ Nemo-lens uses the union of span groups recorded for the enabled preset to deter
 
 ### Resource attributes
 
-`OTEL_RESOURCE_ATTRIBUTES` carries job context as comma-separated `key=value` pairs, with values percent-encoded. The SDK reads it into the Resource with no code, it is inherited across every process spawn, and it costs nothing per span — OTLP serializes a Resource once per export batch. NVRX reads the variable to propagate its own attributes to a worker process by modifying the environment for the worker, but it does not parse the variable or depend upon it for any information that feeds into NVRX logic.
+`OTEL_RESOURCE_ATTRIBUTES` carries job context as comma-separated `key=value` pairs, with values percent-encoded. The SDK reads it into the Resource with no code, it is inherited across every process spawn, and it costs nothing per span — OTLP serializes a Resource once per export batch. NVRX uses Lens's codec to preserve fields and identify missing defaults when it prepares a worker environment. Parsed values do not affect NVRx runtime decisions.
 
 We do not emit duplicate keys in `OTEL_RESOURCE_ATTRIBUTES`. For any NVRX-specific keys, we always overwrite the values as NVRX is the source of truth (we also set attributes in `setup_telemetry()` which always win over environment variables). Do not encode any information you rely on using keys that NVRX may overwrite.
 
@@ -132,7 +132,13 @@ NVRX sets only what describes itself:
 | `service.instance.id` | unique per emitting process — the agent, the trainer, and the checkpoint worker must never collide |
 | `nv.nvrx.ftl.node`    | this node's identity                                                                               |
 
-`OTEL_SERVICE_NAME` is set by the launching environment, so a service always names itself using `setup_telemetry(service_name, instance_id)`. Rank and instance ID are known by the service that launches this one and are propagated via the `OTEL_RESOURCE_ATTRIBUTES` environment variable. Values published via environment variables are always encoded as string types.
+The launching environment sets `OTEL_SERVICE_NAME`. Each NVRx service sets its
+own name with `setup_telemetry(service_name, instance_id)`. The parent process
+passes rank and instance ID through `OTEL_RESOURCE_ATTRIBUTES`.
+
+Environment variables contain strings. When Lens builds the exported Resource,
+it converts supported integer fields, such as rank and world size, to integers.
+The general environment parser returns strings.
 
 Every process and span group that is enabled will export telemetry. An OTel collector may route these spans to different consumers.
 
@@ -296,9 +302,32 @@ A single checkpoint save requires three traces to store:
 
 We do not use links between these traces as these would require additional data be carried across the IPC boundary. This would have been an API change purely for telemetry, which contravenes the no-API-changes-for-telemetry rule.
 
-The persistent async worker process is launched using a modified environment where `OTEL_RESOURCE_ATTRIBUTES` has been set or modified to carry the worker identity. The environment is reset after launching the worker, ensuring that subsequent process spawns do not pick up resource attributes meant for the worker process.
+The persistent async worker inherits the trainer's current
+`OTEL_RESOURCE_ATTRIBUTES` when `Process.start()` runs. This includes attributes
+that the trainer published after NVRx was imported. The worker keeps the trainer's
+rank; `fill_missing={"nv.dl.rank": rank}` supplies a rank if it is missing or empty.
+NVRx sets the worker's role to `ckpt_worker` and its instance ID to
+`nvrx-ckpt{rank}`. The job UUID, run UUID and other trainer attributes are retained.
+
+The checkpoint-worker path selects the current environment with
+`use_current=True`. Other callers use the environment captured when NVRx was
+imported, so later environment changes do not alter the launcher's defaults.
+NVRx uses Lens to parse and format the attributes, then restores the exact
+previous environment when the publication scope ends, including if process start fails.
+Publication scopes can be nested in one thread. They must not overlap across
+threads because threads share the process environment.
+
+Without Lens, publication leaves the environment unchanged. Extension returns
+the selected original attribute string without adding values.
 
 ## What NVRX expects of the training framework
+
+NVRx assigns each checkpoint request a call index. The index can repeat across
+worker attempts, so queries must also use the job identity and
+`nv.nvrx.cycle.index` to match scheduling, worker execution and finalization.
+The framework records the assigned index under the shared `CKPT_CALL_IDX` key
+(`nv.nvrx.ckpt.call_idx`). The worker queue carries no additional span parent
+or link data.
 
 NVRX provides `shared_utils/semconv.py` as a placeholder for shared keys between NVRX and the training framework. At this time, only the `CKPT_CALL_IDX` string is exported – this is what is used to correlate training and worker process' checkpoints.
 
