@@ -28,6 +28,7 @@ import threading
 import time
 import unittest
 import unittest.mock
+from urllib.parse import unquote
 
 from nvidia_resiliency_ext.shared_utils import telemetry
 
@@ -206,6 +207,19 @@ class TestExtendedResourceAttributes(unittest.TestCase):
         self.assertEqual(second.count("nv.nvrx.cycle.index"), 1)
         self.assertEqual(second, "cluster=oci-aga,nv.nvrx.cycle.index=1")
 
+    def test_default_ignores_a_later_environment_value(self):
+        with (
+            unittest.mock.patch.object(
+                telemetry, "_INHERITED_RESOURCE_ATTRIBUTES", "job.uid=imported"
+            ),
+            unittest.mock.patch.dict(
+                "os.environ", {"OTEL_RESOURCE_ATTRIBUTES": "job.uid=live"}, clear=False
+            ),
+        ):
+            result = telemetry.extended_resource_attributes({"nv.nvrx.cycle.index": 2})
+        self.assertIn("job.uid=imported", result)
+        self.assertNotIn("job.uid=live", result)
+
 
 @unittest.skipUnless(telemetry._AVAILABLE, "nemo-lens is not installed")
 class TestPublishResourceAttributes(unittest.TestCase):
@@ -256,6 +270,171 @@ class TestPublishResourceAttributes(unittest.TestCase):
                 published = os.environ["OTEL_RESOURCE_ATTRIBUTES"]
         self.assertEqual(published.count("nv.dl.rank"), 1)
 
+    @staticmethod
+    def _parse(carrier):
+        return {
+            segment.split("=", 1)[0]: unquote(segment.split("=", 1)[1])
+            for segment in carrier.split(",")
+            if "=" in segment
+        }
+
+    def test_live_base_and_mixed_precedence_preserve_valid_rank(self):
+        trainer = (
+            "nv.dl.run.uuid=run-1,nv.dl.job.uuid=job-1,nv.dl.rank=7,"
+            "nv.dl.role=trainer,service.instance.id=trainer-7"
+        )
+        with (
+            unittest.mock.patch.dict(
+                "os.environ", {"OTEL_RESOURCE_ATTRIBUTES": trainer}, clear=False
+            ),
+        ):
+            with telemetry.publish_resource_attributes(
+                {
+                    "nv.dl.role": "ckpt_worker",
+                    "service.instance.id": "nvrx-ckpt3",
+                },
+                use_current=True,
+                fill_missing={"nv.dl.rank": 3},
+            ):
+                published = self._parse(os.environ["OTEL_RESOURCE_ATTRIBUTES"])
+
+            self.assertEqual(published["nv.dl.run.uuid"], "run-1")
+            self.assertEqual(published["nv.dl.job.uuid"], "job-1")
+            self.assertEqual(published["nv.dl.rank"], "7")
+            self.assertEqual(published["nv.dl.role"], "ckpt_worker")
+            self.assertEqual(published["service.instance.id"], "nvrx-ckpt3")
+            self.assertEqual(os.environ["OTEL_RESOURCE_ATTRIBUTES"], trainer)
+
+    def test_lens_discards_malformed_rank_before_filling_it(self):
+        trainer = "nv.dl.rank,nv.dl.role=trainer"
+        with (
+            unittest.mock.patch.dict(
+                "os.environ", {"OTEL_RESOURCE_ATTRIBUTES": trainer}, clear=False
+            ),
+        ):
+            with telemetry.publish_resource_attributes(
+                {"nv.dl.role": "ckpt_worker"},
+                use_current=True,
+                fill_missing={"nv.dl.rank": 3},
+            ):
+                carrier = os.environ["OTEL_RESOURCE_ATTRIBUTES"]
+                published = self._parse(carrier)
+
+            self.assertNotIn("nv.dl.rank", carrier.split(","))
+            self.assertEqual(published["nv.dl.rank"], "3")
+            self.assertEqual(published["nv.dl.role"], "ckpt_worker")
+            self.assertEqual(os.environ["OTEL_RESOURCE_ATTRIBUTES"], trainer)
+
+    def test_snapshot_publication_excludes_live_only_keys(self):
+        trainer = "job.uid=live,nv.dl.rank=7,extra=live-only"
+        with unittest.mock.patch.dict(os.environ, {"OTEL_RESOURCE_ATTRIBUTES": trainer}):
+            with telemetry.publish_resource_attributes({"nv.nvrx.cycle.index": 2}):
+                self.assertEqual(
+                    self._parse(os.environ["OTEL_RESOURCE_ATTRIBUTES"]),
+                    {"job.uid": "abc", "nv.nvrx.cycle.index": "2"},
+                )
+            self.assertEqual(os.environ["OTEL_RESOURCE_ATTRIBUTES"], trainer)
+
+    def test_nested_publications_restore_exact_values_on_error(self):
+        original = "job.uid=abc, nv.dl.rank=7,label=a%2cb%3dc"
+        with unittest.mock.patch.dict(os.environ, {"OTEL_RESOURCE_ATTRIBUTES": original}):
+            with telemetry.publish_resource_attributes({"outer": "a,b=c"}, use_current=True):
+                outer = os.environ["OTEL_RESOURCE_ATTRIBUTES"]
+                with self.assertRaisesRegex(RuntimeError, "spawn failed"):
+                    with telemetry.publish_resource_attributes(
+                        {"nv.dl.role": "ckpt_worker"}, use_current=True
+                    ):
+                        inner = self._parse(os.environ["OTEL_RESOURCE_ATTRIBUTES"])
+                        self.assertEqual(inner["outer"], "a,b=c")
+                        self.assertEqual(inner["label"], "a,b=c")
+                        raise RuntimeError("spawn failed")
+                self.assertEqual(os.environ["OTEL_RESOURCE_ATTRIBUTES"], outer)
+            self.assertEqual(os.environ["OTEL_RESOURCE_ATTRIBUTES"], original)
+
+    def test_rank_defaults_follow_lens_absent_value_semantics(self):
+        for carrier, expected in (
+            ("", "3"),
+            ("nv.dl.rank=", "3"),
+            ("nv.dl.rank", "3"),
+            ("nv.dl.rank=bad", "bad"),
+            ("nv.dl.rank=7", "7"),
+        ):
+            with self.subTest(carrier=carrier):
+                with unittest.mock.patch.dict(os.environ, {"OTEL_RESOURCE_ATTRIBUTES": carrier}):
+                    with telemetry.publish_resource_attributes(
+                        {"nv.dl.role": "ckpt_worker"},
+                        use_current=True,
+                        fill_missing={"nv.dl.rank": 3},
+                    ):
+                        attrs = self._parse(os.environ["OTEL_RESOURCE_ATTRIBUTES"])
+                        self.assertEqual(attrs["nv.dl.rank"], expected)
+                    self.assertEqual(os.environ["OTEL_RESOURCE_ATTRIBUTES"], carrier)
+
+    def test_live_base_fills_rank_when_the_trainer_carrier_has_none(self):
+        trainer = "nv.dl.run.uuid=run-1,nv.dl.role=trainer"
+        with unittest.mock.patch.dict(
+            "os.environ", {"OTEL_RESOURCE_ATTRIBUTES": trainer}, clear=False
+        ):
+            with telemetry.publish_resource_attributes(
+                {"nv.dl.role": "ckpt_worker"},
+                use_current=True,
+                fill_missing={"nv.dl.rank": 3},
+            ):
+                published = self._parse(os.environ["OTEL_RESOURCE_ATTRIBUTES"])
+        self.assertEqual(published["nv.dl.rank"], "3")
+        self.assertEqual(os.environ["OTEL_RESOURCE_ATTRIBUTES"], "job.uid=abc")
+
+
+class TestResourcePublicationWithoutLens(unittest.TestCase):
+    def test_fresh_process_without_optional_imports(self):
+        import subprocess
+        import sys
+
+        code = r"""
+import importlib.abc
+import importlib.util
+import os
+import sys
+
+class BlockOptional(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == sys.argv[2] or fullname.startswith(sys.argv[2] + "."):
+            raise ModuleNotFoundError(fullname)
+sys.meta_path.insert(0, BlockOptional())
+os.environ['OTEL_RESOURCE_ATTRIBUTES'] = 'job.uid=imported'
+spec = importlib.util.spec_from_file_location('isolated_telemetry', sys.argv[1])
+telemetry = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(telemetry)
+assert not telemetry._AVAILABLE
+for original in (None, '', 'job.uid=live,nv.dl.rank=7'):
+    if original is None:
+        os.environ.pop('OTEL_RESOURCE_ATTRIBUTES', None)
+    else:
+        os.environ['OTEL_RESOURCE_ATTRIBUTES'] = original
+    assert telemetry.extended_resource_attributes({'role': 'worker'}) == 'job.uid=imported'
+    assert telemetry.extended_resource_attributes(
+        {'role': 'worker'}, use_current=True, fill_missing={'nv.dl.rank': 3}
+    ) == (original or '')
+    try:
+        with telemetry.publish_resource_attributes(
+            {'role': 'worker'}, use_current=True, fill_missing={'nv.dl.rank': 3}
+        ):
+            assert os.environ.get('OTEL_RESOURCE_ATTRIBUTES') == original
+            raise RuntimeError('workload error')
+    except RuntimeError:
+        pass
+    assert os.environ.get('OTEL_RESOURCE_ATTRIBUTES') == original
+"""
+        for blocked in ("nemo.lens", "opentelemetry"):
+            with self.subTest(blocked=blocked):
+                result = subprocess.run(
+                    [sys.executable, "-c", code, telemetry.__file__, blocked],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
 
 class TestPhase(unittest.TestCase):
     """A phase is a mark now and a backdated span later; check the two line up.
@@ -299,7 +478,7 @@ class TestPhase(unittest.TestCase):
         self.assertEqual(
             self.marks, [("nvrx.ft", "nv.nvrx.ftl.cycle_start", {"nv.nvrx.cycle.index": 2})]
         )
-        (group, name, start, end, attributes, parent) = self.spans[0]
+        group, name, start, end, attributes, parent = self.spans[0]
         self.assertEqual((group, name), ("nvrx.ft", "nv.nvrx.ftl.cycle"))
         # The span covers the window, rather than being an instant at close.
         self.assertLessEqual(before, start)

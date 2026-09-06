@@ -68,6 +68,9 @@ try:
     from nemo.lens import trace_fn as trace_fn
     from nemo.lens.resources import extend_otel_resource_attributes as _extend_resource_attributes
     from nemo.lens.resources import publish_otel_resource_attributes as _publish_resource_attributes
+    from nemo.lens.resources.attributes import (
+        parse_otel_resource_attributes as _parse_resource_attributes,
+    )
     from nemo.lens.span_utilities import emit_span as _emit_span
     from nemo.lens.span_utilities import linux_process_create_time as _process_create_time
     from opentelemetry import context as _otel_context
@@ -272,34 +275,64 @@ def set_span_attributes(attributes: dict) -> None:
     _safe_set_span_attributes(_otel_trace.get_current_span(), attributes)
 
 
-def extended_resource_attributes(attributes: dict) -> str:
-    """Extend the inherited ``OTEL_RESOURCE_ATTRIBUTES`` with more pairs.
+def extended_resource_attributes(
+    attributes: dict, *, use_current: bool = False, fill_missing: Optional[dict] = None
+) -> str:
+    """Return an ``OTEL_RESOURCE_ATTRIBUTES`` string with the supplied attributes.
 
-    NVRx never parses the variable -- it is an opaque string to extend. Extending is
-    always from the value inherited at start, never from the last extension, or a
-    relaunched cohort accumulates a key per cycle. ``overwrite`` because an NVRx key
-    already in the inherited value is stale: this process is the authority on it.
-    Returns the inherited value unchanged when nemo-lens is absent: NVRx emits no
-    telemetry then, so it has nothing to say about this process.
+    By default, start from the value saved when this module was imported. This
+    prevents later environment changes from affecting subsequent worker launches.
+    Set ``use_current=True`` to include attributes published since import, such as
+    the trainer's attributes when starting a checkpoint worker.
+
+    ``fill_missing`` supplies values for missing or empty attributes. Values in
+    ``attributes`` replace existing values. Lens parses and formats the string.
+    Without Lens, return the selected string unchanged.
     """
+    key = "OTEL_RESOURCE_ATTRIBUTES"
+    base = os.environ.get(key, "") if use_current else _INHERITED_RESOURCE_ATTRIBUTES
     if not _AVAILABLE:
-        return _INHERITED_RESOURCE_ATTRIBUTES
-    return _extend_resource_attributes(_INHERITED_RESOURCE_ATTRIBUTES, attributes, overwrite=True)
+        return base
+    if fill_missing:
+        # Use defaults for missing or empty values.
+        # Keep existing nonempty values, even if malformed.
+        empty_defaults = {
+            name
+            for name, value in _parse_resource_attributes(base).items()
+            if name in fill_missing and value == ""
+        }
+        base = _extend_resource_attributes(
+            base, fill_missing, overwrite=False, exclude=empty_defaults
+        )
+    return _extend_resource_attributes(base, attributes, overwrite=True)
 
 
 @contextmanager
-def publish_resource_attributes(attributes: dict):
-    """Publish attributes into the environment, for a child spawned inside.
+def publish_resource_attributes(
+    attributes: dict, *, use_current: bool = False, fill_missing: Optional[dict] = None
+):
+    """Temporarily set environment attributes for a child process.
 
-    ``multiprocessing.Process`` has no ``env``, so the environment at ``start()``
-    is the only channel to a spawned child. Wrap that call. nemo-lens restores the
-    previous value on the way out, including on error -- left set, it would describe
-    this process and every later child of it. Values arrive in the child as strings.
+    Call ``multiprocessing.Process.start()`` inside this scope so the child
+    inherits the selected attributes. The arguments have the same meaning as in
+    ``extended_resource_attributes``. Lens restores the previous environment value
+    when the scope exits, including on error. Without Lens, leave the environment
+    unchanged.
     """
     if not _AVAILABLE:
         yield
         return
-    with _publish_resource_attributes(attributes, overwrite=True):
+    carrier = extended_resource_attributes(
+        attributes, use_current=use_current, fill_missing=fill_missing
+    )
+    # Replace the current environment attributes with the selected attributes.
+    # When using the import-time values, omit attributes added since import.
+    # Lens restores the previous environment when this scope exits.
+    with _publish_resource_attributes(
+        _parse_resource_attributes(carrier),
+        overwrite=True,
+        exclude=_parse_resource_attributes(os.environ.get("OTEL_RESOURCE_ATTRIBUTES", "")),
+    ):
         yield
 
 

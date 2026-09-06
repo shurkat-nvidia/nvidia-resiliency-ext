@@ -512,10 +512,15 @@ class PersistentAsyncCaller(AsyncCaller):
             daemon=self.background_worker_is_daemon,
         )
 
-        # Propagate resource attributes for the background worker process
-        # through the environment.
+        # Read the trainer's current attributes. NVRx may have been imported
+        # before the trainer published them.
         with telemetry.publish_resource_attributes(
-            {"nv.dl.rank": rank, "service.instance.id": f"nvrx-ckpt{rank}"}
+            {
+                "nv.dl.role": "ckpt_worker",
+                "service.instance.id": f"nvrx-ckpt{rank}",
+            },
+            use_current=True,
+            fill_missing={"nv.dl.rank": rank},
         ):
             self.process.start()
         logger.debug(f"PersistentAsyncCaller: {rank}, Started Async Caller {self.process}")
