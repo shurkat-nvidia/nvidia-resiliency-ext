@@ -242,10 +242,11 @@ def _emit(
         name,
         start,
         end,
+        group=group,
         context=context,
         attributes=attributes,
     )
-    return recorded.get_span_context()
+    return recorded.get_span_context() if recorded is not None else None
 
 
 def backdated_span(
@@ -255,14 +256,16 @@ def backdated_span(
     end: Optional[float],
     attributes: Optional[dict] = None,
     parent=None,
-) -> None:
+):
     """Record a span for a window that elapsed before there was a tracer.
 
     ``start`` and ``end`` are wall-clock seconds; ``parent`` is usually the
     ``SpanContext`` of the ``mark`` that opened the window, and without one the span
-    roots its own trace. A no-op unless the window is a positive interval.
+    starts a new trace. Lens validates timestamps, checks whether the group is
+    enabled, and ends the span. Zero duration is valid. Return the recorded span's
+    context, or None if no span was recorded.
     """
-    if start is None or end is None or end <= start:
+    if start is None or end is None:
         return
     if not _AVAILABLE or not _is_span_group_enabled(group):
         return
@@ -271,7 +274,7 @@ def backdated_span(
     context = _otel_context.Context()
     if parent is not None:
         context = _otel_trace.set_span_in_context(_otel_trace.NonRecordingSpan(parent), context)
-    _emit(group, name, start, end, attributes, context)
+    return _emit(group, name, start, end, attributes, context)
 
 
 def mark(group: str, name: str, attributes: Optional[dict] = None):
@@ -281,6 +284,8 @@ def mark(group: str, name: str, attributes: Optional[dict] = None):
     immediately, so the context outlives it -- ids, not a handle to anything live.
     Inherits the ambient span, so a mark nests where an ordinary span would.
     """
+    if not _AVAILABLE or not _is_span_group_enabled(group):
+        return None
     now = time.time()
     return _emit(group, name, now, now, attributes)
 

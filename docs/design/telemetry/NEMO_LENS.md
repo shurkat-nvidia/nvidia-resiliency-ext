@@ -45,6 +45,18 @@ graph TD
 
 ## `shared_utils/telemetry.py`
 
+### Timed spans
+
+NVRx uses Lens's `span_utilities.emit_span()` to record intervals and
+zero-duration markers. Equal start and end timestamps are valid. Lens clamps
+inversions of at most 30 ms by default to zero duration and warns; larger
+inversions raise `ValueError`. Lens callers can override the finite, non-negative
+tolerance with `emit_span(..., eps_ms=...)`; zero rejects every inversion.
+NVRx passes its timestamps unchanged and uses the default, preserving the original
+import window. Startup intervals with missing timestamps are omitted.
+This requires a Lens revision containing the timestamp tolerance change;
+support for the `group` argument alone is insufficient.
+
 ### Job and worker-attempt identity
 
 A launcher handles multiple worker attempts, so setup does not derive an attempt
