@@ -181,6 +181,94 @@ class TestManualSpan(unittest.TestCase):
         span.close()
 
 
+@unittest.skipUnless(telemetry._AVAILABLE, "requires nemo-lens")
+class TestLensTimedEmission(unittest.TestCase):
+    def setUp(self):
+        self.gate = self.enterContext(
+            unittest.mock.patch.object(telemetry, "_is_span_group_enabled", return_value=True)
+        )
+        self.emit = self.enterContext(unittest.mock.patch.object(telemetry, "_emit_span"))
+        self.tracer = self.enterContext(unittest.mock.patch.object(telemetry, "_get_tracer"))
+
+    def test_interval_forwards_group_and_parent_and_returns_context_or_none(self):
+        from opentelemetry import trace
+
+        parent = trace.SpanContext(1, 2, False)
+        for supplied_parent in (None, parent):
+            with self.subTest(parent=supplied_parent):
+                result = telemetry.backdated_span(
+                    "nvrx.ft", "interval", 1, 2, parent=supplied_parent
+                )
+                self.assertIs(result, self.emit.return_value.get_span_context.return_value)
+                args, kwargs = self.emit.call_args
+                self.assertEqual(args, (self.tracer.return_value, "interval", 1, 2))
+                self.assertEqual(kwargs["group"], "nvrx.ft")
+                context = kwargs["context"]
+                self.assertIsNotNone(context)
+                self.assertEqual(
+                    trace.get_current_span(context).get_span_context(),
+                    supplied_parent or trace.INVALID_SPAN_CONTEXT,
+                )
+        self.emit.return_value = None
+        self.assertIsNone(telemetry.backdated_span("nvrx.ft", "interval", 1, 2))
+        self.emit.reset_mock()
+        for start, end in ((None, 2), (1, None), (None, None)):
+            self.assertIsNone(telemetry.backdated_span("nvrx.ft", "missing", start, end))
+        self.emit.assert_not_called()
+
+    def test_mark_reads_clock_once(self):
+        with unittest.mock.patch.object(telemetry.time, "time", return_value=1000) as clock:
+            result = telemetry.mark("nvrx.ft", "instant")
+        clock.assert_called_once_with()
+        self.assertIs(result, self.emit.return_value.get_span_context.return_value)
+        self.emit.assert_called_once_with(
+            self.tracer.return_value,
+            "instant",
+            1000,
+            1000,
+            group="nvrx.ft",
+            context=None,
+            attributes=None,
+        )
+
+    def test_gate_precedes_clock_context_and_attribute_work(self):
+        self.gate.return_value = False
+        with (
+            unittest.mock.patch.object(telemetry.time, "time", side_effect=AssertionError("clock")),
+            unittest.mock.patch.object(
+                telemetry._otel_context, "Context", side_effect=AssertionError("context")
+            ),
+        ):
+            self.assertIsNone(telemetry.mark("nvrx.ft", "disabled"))
+            self.assertIsNone(telemetry.backdated_span("nvrx.ft", "disabled", 1, 2))
+        self.tracer.assert_not_called()
+        self.emit.assert_not_called()
+
+    def test_phase_close_restores_context_when_emission_fails(self):
+        from opentelemetry import trace
+
+        current = trace.get_current_span()
+        self.emit.return_value.get_span_context.return_value = trace.SpanContext(1, 2, False)
+        phase = telemetry.Phase()
+        self.addCleanup(phase.close)
+        cycle_scope, joined_scope = unittest.mock.MagicMock(), unittest.mock.MagicMock()
+        self.enterContext(
+            unittest.mock.patch.object(
+                telemetry, "_span_attributes", side_effect=[cycle_scope, joined_scope]
+            )
+        )
+        phase.open("nvrx.ft", "cycle", scoped_attributes={"nv.dl.run.uuid": "attempt"})
+        phase.set(scoped_attributes={"nv.nvrx.ftl.membership": "active"})
+        self.emit.side_effect = RuntimeError("emission failed")
+        with self.assertRaisesRegex(RuntimeError, "emission failed"):
+            phase.close()
+        self.assertIs(trace.get_current_span(), current)
+        cycle_scope.__exit__.assert_called_once()
+        joined_scope.__exit__.assert_called_once()
+        self.assertIsNone(phase._start)
+        phase.close()
+
+
 class TestMarkAndFlush(unittest.TestCase):
 
     def test_mark_is_inert(self):
@@ -230,8 +318,8 @@ class TestBackdatedSpan(unittest.TestCase):
         telemetry.backdated_span("job", "pre_startup", 1000.0, None)
         telemetry.backdated_span("job", "pre_startup", None, None)
 
-    def test_non_positive_window_is_dropped(self):
-        # A coarse clock can make a fast window measure as zero-length or inverted.
+    def test_disabled_windows_are_inert(self):
+        # Disabled instrumentation does not validate or emit these windows.
         telemetry.backdated_span("job", "nv.nvrx.ftl.python.imports", 1016.7, 1000.0)
         telemetry.backdated_span("job", "nv.nvrx.ftl.python.imports", 1000.0, 1000.0)
 

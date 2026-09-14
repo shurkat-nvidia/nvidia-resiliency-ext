@@ -45,6 +45,13 @@ graph TD
 
 ## `shared_utils/telemetry.py`
 
+### Timed spans
+
+NVRx uses Lens's `span_utilities.emit_span()` to record intervals and
+zero-duration markers. Equal start and end timestamps are valid; an end before
+the start is rejected. Startup intervals with missing timestamps are omitted.
+This requires a Lens version that supports the `group` argument to `emit_span()`.
+
 ### Job and worker-attempt identity
 
 A launcher handles multiple worker attempts. Its Resource contains the job UUID,
