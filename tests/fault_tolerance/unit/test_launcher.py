@@ -1935,3 +1935,46 @@ class TestLauncherAllowedRoots:
         from nvidia_resiliency_ext.fault_tolerance.launcher import _resolve_grpc_log_allowed_roots
 
         assert _resolve_grpc_log_allowed_roots(self._args()) == []
+
+
+class TestCycleTelemetry(unittest.TestCase):
+    def test_worker_environment_uses_cycle_uuid_and_restart_count(self):
+        from nvidia_resiliency_ext.fault_tolerance import launcher
+        from nvidia_resiliency_ext.shared_utils import telemetry
+
+        if not telemetry._AVAILABLE:
+            self.skipTest("requires nemo-lens")
+        agent = MagicMock()
+        agent._node_id = "node"
+        agent._infra_placement_attrs.return_value = {}
+        agent._launch_budget_attrs.return_value = {}
+        agent._current_cycle_info_path.return_value = None
+        agent._log_line_prefix_template = None
+        group = agent._worker_group
+        group.spec.rdzv_handler.get_run_id.return_value = "rdzv"
+        group.spec.role = "trainer"
+        group.spec.args = ()
+        group.spec.entrypoint = lambda: None
+        group.workers = [MagicMock(local_rank=0)]
+        previous_uuid = None
+        with (
+            patch.object(launcher, "start_processes") as start,
+            patch.object(launcher, "record_profiling_event"),
+            patch.dict(os.environ, {"SLURM_JOB_ID": "123", "SLURM_CLUSTER_NAME": "test"}),
+        ):
+            start.return_value.pids.return_value = {}
+            for round_number in (0, 3):
+                with self.subTest(round_number=round_number):
+                    agent._get_global_cycle_number.return_value = round_number
+                    launcher.LocalElasticAgent._open_telemetry_cycle(agent, round_number)
+                    run_uuid = agent._cycle_phase.open.call_args.kwargs["scoped_attributes"][
+                        "nv.dl.run.uuid"
+                    ]
+                    self.assertIsNotNone(run_uuid)
+                    self.assertNotEqual(run_uuid, previous_uuid)
+                    previous_uuid = run_uuid
+                    launcher.LocalElasticAgent._start_workers(agent, group)
+                    env = start.call_args.kwargs["envs"][0]
+                    attrs = telemetry._parse_resource_attributes(env["OTEL_RESOURCE_ATTRIBUTES"])
+                    self.assertEqual(attrs["nv.dl.run.uuid"], run_uuid)
+                    self.assertEqual(env["TORCHELASTIC_RESTART_COUNT"], str(round_number))

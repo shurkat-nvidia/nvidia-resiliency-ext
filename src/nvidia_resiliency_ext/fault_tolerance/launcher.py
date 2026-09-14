@@ -557,6 +557,7 @@ class LocalElasticAgent(SimpleElasticAgent):
             "nvrx.ft_launcher",
             f"nvrx-agent-{self._node_id}",
             {"nv.nvrx.ftl.node": self._node_id},
+            derive_run_uuid=False,
         )
         telemetry.record_process_startup(
             "nvrx.job", __imports_started__, __imports_finished__, {"nv.nvrx.ftl.node": self._node_id}
@@ -1141,6 +1142,7 @@ class LocalElasticAgent(SimpleElasticAgent):
         )
 
         worker_resource_attrs = {
+            **telemetry.worker_run_attributes(restart_count, spec.rdzv_handler.get_run_id()),
             "nv.nvrx.cycle.index": restart_count,
             "nv.nvrx.ftl.membership": "active",
             **self._infra_placement_attrs(),
@@ -1523,12 +1525,6 @@ class LocalElasticAgent(SimpleElasticAgent):
         # this will always be FtRendezvousBarrierHandler.
         spec.rdzv_handler.set_worker_group(worker_group)
 
-        opening = {
-            "nv.nvrx.cycle.index": self._get_global_cycle_number(),
-            "nv.nvrx.ftl.node": self._node_id,
-            "nv.nvrx.ftl.membership": "unjoined",
-        }
-        self._cycle_phase.open("nvrx.ft", "nv.nvrx.ftl.cycle", opening)
         try:
             # Call the parent class _rendezvous method
             super()._rendezvous(worker_group)
@@ -1539,7 +1535,33 @@ class LocalElasticAgent(SimpleElasticAgent):
             # job ended while it waited
             self._cycle_phase.close({CYCLE_OUTCOME: "standby", "nv.nvrx.ftl.membership": "standby"})
             raise
-        self._cycle_phase.set(self._joined_cycle_attrs(worker_group))
+        self._cycle_phase.set(
+            self._joined_cycle_attrs(worker_group),
+            scoped_attributes={
+                "nv.nvrx.ftl.group.rank": worker_group.group_rank,
+                "nv.nvrx.ftl.group.world_size": worker_group.group_world_size,
+                "nv.nvrx.ftl.membership": "active",
+            }
+        )
+
+    def _open_telemetry_cycle(self, restart_count: int) -> None:
+        """Start the cycle after the barrier sets the round number."""
+        identity = telemetry.worker_run_attributes(
+            restart_count, self._worker_group.spec.rdzv_handler.get_run_id()
+        )
+        self._cycle_phase.open(
+            "nvrx.ft",
+            "nv.nvrx.ftl.cycle",
+            {
+                "nv.nvrx.ftl.node": self._node_id,
+                "nv.nvrx.ftl.membership": "unjoined",
+            },
+            scoped_attributes={**identity, "nv.nvrx.cycle.index": restart_count},
+        )
+
+    def _close_telemetry_cycle(self, attributes=None) -> None:
+        """Close the cycle before waiting for another round."""
+        self._cycle_phase.close(attributes)
 
 
 # Source
