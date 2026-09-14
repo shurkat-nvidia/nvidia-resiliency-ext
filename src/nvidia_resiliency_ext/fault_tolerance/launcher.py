@@ -463,6 +463,7 @@ class LocalElasticAgent(SimpleElasticAgent):
 
         self._cycle_phase = telemetry.Phase()
         self._run_phase = telemetry.Phase()
+        self._cycle_identity: Optional[dict] = None
 
     DEFAULT_ROLE = "default"  # FIXME
 
@@ -699,7 +700,7 @@ class LocalElasticAgent(SimpleElasticAgent):
                     self._exit_barrier_timeout,
                 )
                 self._run_phase.close()
-                self._cycle_phase.close({CYCLE_OUTCOME: "completed"})
+                self._close_telemetry_cycle({CYCLE_OUTCOME: "completed"})
                 self._exit_barrier()
                 return run_result
 
@@ -724,7 +725,7 @@ class LocalElasticAgent(SimpleElasticAgent):
                 self._run_phase.close()
                 rdzv_handler.signal_no_restart(RDZV_SHUTDOWN_REASON_ATTRIBUTION_STOP)
                 self._stop_workers(self._worker_group)
-                self._cycle_phase.close({CYCLE_OUTCOME: "terminated"})
+                self._close_telemetry_cycle({CYCLE_OUTCOME: "terminated"})
                 self._worker_group.state = WorkerState.FAILED
                 raise NoRestartRequested(
                     RDZV_SHUTDOWN_REASON_ATTRIBUTION_STOP,
@@ -776,7 +777,7 @@ class LocalElasticAgent(SimpleElasticAgent):
 
                 # No more restarts (either exhausted or early termination)
                 self._stop_workers(self._worker_group)
-                self._cycle_phase.close()
+                self._close_telemetry_cycle()
                 self._worker_group.state = WorkerState.FAILED
                 return RunResult(state=WorkerState.FAILED, failures=run_result.failures)
             elif state == WorkerState.HEALTHY:
@@ -798,7 +799,7 @@ class LocalElasticAgent(SimpleElasticAgent):
                         )
                         self._run_phase.close()
                         self._stop_workers(self._worker_group)
-                        self._cycle_phase.close({CYCLE_OUTCOME: "terminated"})
+                        self._close_telemetry_cycle({CYCLE_OUTCOME: "terminated"})
                         self._worker_group.state = WorkerState.FAILED
                         raise NoRestartRequested(no_restart)
 
@@ -821,7 +822,7 @@ class LocalElasticAgent(SimpleElasticAgent):
 
                     if not should_restart:
                         self._stop_workers(self._worker_group)
-                        self._cycle_phase.close()
+                        self._close_telemetry_cycle()
                         self._worker_group.state = WorkerState.FAILED
                         return RunResult(state=WorkerState.FAILED)
             else:
@@ -1129,10 +1130,10 @@ class LocalElasticAgent(SimpleElasticAgent):
         store = worker_group.store
         assert store is not None
 
-        # Get the current cycle number from the rendezvous handler
-        # At this point, rendezvous has completed and we're about to start workers.
-        # The cycle number is used for profiling and environment variable setting.
-        restart_count = self._get_global_cycle_number()
+        if self._cycle_identity is None:
+            raise RuntimeError("worker launch requires an active telemetry cycle identity")
+        cycle_identity = dict(self._cycle_identity)
+        restart_count = cycle_identity["nv.nvrx.cycle.index"]
 
         # Send current cycle number to rank monitors for logging
         self._send_cycle_to_rank_monitors(restart_count)
@@ -1141,7 +1142,7 @@ class LocalElasticAgent(SimpleElasticAgent):
         )
 
         worker_resource_attrs = {
-            "nv.nvrx.cycle.index": restart_count,
+            **cycle_identity,
             "nv.nvrx.ftl.membership": "active",
             **self._infra_placement_attrs(),
             **self._launch_budget_attrs(),
@@ -1523,23 +1524,54 @@ class LocalElasticAgent(SimpleElasticAgent):
         # this will always be FtRendezvousBarrierHandler.
         spec.rdzv_handler.set_worker_group(worker_group)
 
-        opening = {
-            "nv.nvrx.cycle.index": self._get_global_cycle_number(),
-            "nv.nvrx.ftl.node": self._node_id,
-            "nv.nvrx.ftl.membership": "unjoined",
-        }
-        self._cycle_phase.open("nvrx.ft", "nv.nvrx.ftl.cycle", opening)
         try:
             # Call the parent class _rendezvous method
             super()._rendezvous(worker_group)
         except UnhealthyNodeException:
-            self._cycle_phase.close({CYCLE_OUTCOME: "excluded"})  # failed the health check
+            self._close_telemetry_cycle({CYCLE_OUTCOME: "excluded"})  # failed the health check
             raise
         except (RendezvousClosedError, RendezvousGracefulExitError):
             # job ended while it waited
-            self._cycle_phase.close({CYCLE_OUTCOME: "standby", "nv.nvrx.ftl.membership": "standby"})
+            self._close_telemetry_cycle(
+                {CYCLE_OUTCOME: "standby", "nv.nvrx.ftl.membership": "standby"}
+            )
             raise
-        self._cycle_phase.set(self._joined_cycle_attrs(worker_group))
+        self._cycle_phase.set(
+            self._joined_cycle_attrs(worker_group),
+            scoped_attributes={
+                "nv.nvrx.ftl.group.rank": worker_group.group_rank,
+                "nv.nvrx.ftl.group.world_size": worker_group.group_world_size,
+                "nv.nvrx.ftl.membership": "active",
+            }
+        )
+
+    def _open_telemetry_cycle(self, restart_count: int) -> None:
+        """Start the cycle after the barrier sets the round number."""
+        self._cycle_identity = {
+            **telemetry.worker_run_attributes(
+                restart_count, self._worker_group.spec.rdzv_handler.get_run_id()
+            ),
+            "nv.nvrx.cycle.index": restart_count,
+        }
+        self._cycle_phase.open(
+            "nvrx.ft",
+            "nv.nvrx.ftl.cycle",
+            {
+                "nv.nvrx.ftl.node": self._node_id,
+                "nv.nvrx.ftl.membership": "unjoined",
+            },
+            scoped_attributes=self._cycle_identity,
+        )
+
+    def _close_telemetry_cycle(self, attributes=None) -> None:
+        """Close the cycle before waiting for another round."""
+        try:
+            if attributes is None:
+                self._cycle_phase.close()
+            else:
+                self._cycle_phase.close(attributes)
+        finally:
+            self._cycle_identity = None
 
 
 # Source
