@@ -1910,12 +1910,15 @@ class _RendezvousBarrierState:
             # Telemetry rendezvous span closed before the wait, so a hot spare
             # idling here does not sit inside the previous round's span.
             self._rdzv_span.close()
+            self._agent._close_telemetry_cycle()
             record_profiling_event(ProfilingEvent.AWAIT_ROUND_STARTED, node_id=node_desc)
             try:
                 with span("nvrx.ft", "nv.nvrx.ftl.await_round"):
                     self._wait_for_rendezvous_open(node_desc)
             finally:
                 record_profiling_event(ProfilingEvent.AWAIT_ROUND_COMPLETED, node_id=node_desc)
+
+            self._agent._open_telemetry_cycle(self._round)
 
             # Record start time for timeout monitoring.
             # Start timing AFTER Step 0 completes, since nodes may wait indefinitely at Step 0.
@@ -2028,6 +2031,8 @@ class _RendezvousBarrierState:
                     f"[{node_desc}] Detected newer rendezvous round {e.observed_round} "
                     f"while joining round {e.attempted_round}; retrying"
                 )
+                self._rdzv_span.close()
+                self._agent._close_telemetry_cycle({"nv.nvrx.cycle.outcome": "peer_restart"})
                 continue
 
             log.debug(f"[slot={self._slot}] [Step 1] Joined round {self._round}")
@@ -2065,6 +2070,15 @@ class _RendezvousBarrierState:
                     f"waiting for round {self._round + 1} to open"
                 )
                 self._rdzv_span.set({"nv.nvrx.ftl.membership": "standby"})
+            self._rdzv_span.close()
+            self._agent._close_telemetry_cycle(
+                {
+                    "nv.nvrx.cycle.outcome": "standby",
+                    "nv.nvrx.ftl.membership": (
+                        "late_joiner" if rank == GroupRankStatus.UNASSIGNED.value else "standby"
+                    ),
+                }
+            )
             # Loop back to Step 0; _sync_from_per_round_state() will advance _round
             # from N to N+1 when it sees round_done_N=1 (closed).
 

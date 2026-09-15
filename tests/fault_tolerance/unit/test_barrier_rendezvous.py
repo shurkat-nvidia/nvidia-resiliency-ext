@@ -527,6 +527,7 @@ class BarrierStateBasicTest(BaseRendezvousTest):
                 is_store_host=True,
                 join_timeout_seconds=TEST_JOIN_TIMEOUT_SECS,
             )
+            state._agent = MagicMock()
 
             def fail_health_check():
                 raise ft_rendezvous_barrier_module.UnhealthyNodeException("bad node")
@@ -2671,6 +2672,58 @@ class ErrorCaseTest(BaseRendezvousTest):
         """Clean up test fixtures."""
         super().tearDown()  # Restores environment variables
 
+    def test_cycle_uses_synchronized_round_and_closes_before_retry(self):
+        for rank in (4, -1, None):  # standby, late joiner, stale round
+            with self.subTest(rank=rank):
+                state = _RendezvousBarrierState(self.store, self.run_id, False)
+                events = MagicMock()
+                state._agent, state._rdzv_span = events.agent, events.rendezvous
+
+                def wait(node):
+                    events.wait()
+                    if events.wait.call_count == 2:
+                        raise RendezvousGracefulExitError()
+                    state._round = 3
+
+                error = _StaleRendezvousRoundError(6, 3, "rank") if rank is None else None
+                with (
+                    patch.object(state, "_wait_for_rendezvous_open", side_effect=wait),
+                    patch.object(state, "_wait_for_round_done", return_value=(rank, 5)),
+                    patch.object(state, "_round_fenced_compare_set", side_effect=error),
+                    patch.object(
+                        ft_rendezvous_barrier_module, "get_infrastructure_rank", return_value=0
+                    ),
+                    self.assertRaises(RendezvousGracefulExitError),
+                ):
+                    state.perform_rendezvous(self.node_desc_gen.generate(), 1, 1)
+                self.assertEqual(
+                    events.mock_calls[:4],
+                    [
+                        call.rendezvous.close(),
+                        call.agent._close_telemetry_cycle(),
+                        call.wait(),
+                        call.agent._open_telemetry_cycle(3),
+                    ],
+                )
+                attrs = (
+                    {"nv.nvrx.cycle.outcome": "peer_restart"}
+                    if rank is None
+                    else {
+                        "nv.nvrx.cycle.outcome": "standby",
+                        "nv.nvrx.ftl.membership": "late_joiner" if rank == -1 else "standby",
+                    }
+                )
+                self.assertEqual(
+                    events.mock_calls[-5:],
+                    [
+                        call.rendezvous.close(),
+                        call.agent._close_telemetry_cycle(attrs),
+                        call.rendezvous.close(),
+                        call.agent._close_telemetry_cycle(),
+                        call.wait(),
+                    ],
+                )
+
     def test_slot_beyond_max_nodes_is_not_fatal(self):
         """A slot index beyond max_nodes must NOT shut down the rendezvous.
 
@@ -2690,6 +2743,7 @@ class ErrorCaseTest(BaseRendezvousTest):
             is_store_host=False,
             join_timeout_seconds=1.0,
         )
+        state._agent = MagicMock()
         self.store.add(state.join_count_key, max_nodes)
 
         with self.assertRaises(RendezvousTimeoutError):
@@ -2720,6 +2774,7 @@ class ErrorCaseTest(BaseRendezvousTest):
             is_store_host=False,
             join_timeout_seconds=1.0,
         )
+        state._agent = MagicMock()
         self.store.add(state.join_count_key, max_nodes)
 
         with self.assertRaises(RendezvousTimeoutError):
@@ -2753,6 +2808,7 @@ class ErrorCaseTest(BaseRendezvousTest):
             is_store_host=True,
             join_timeout_seconds=1.0,  # Use very short timeout to test timeout behavior
         )
+        state._agent = MagicMock()
         min_nodes = 5  # Require 5 nodes but we'll only provide 1
         max_nodes = 5
         segment_check_interval = _test_segment_check_interval()
@@ -2770,6 +2826,7 @@ class ErrorCaseTest(BaseRendezvousTest):
             is_store_host=True,
             join_timeout_seconds=TEST_JOIN_TIMEOUT_SECS,
         )
+        state._agent = MagicMock()
 
         # Permanently close the rendezvous
         state.set_shutdown()
@@ -3563,6 +3620,7 @@ class SignalRendezvousTest(BaseRendezvousTest):
             timeout=RendezvousTimeout(join=timedelta(seconds=TEST_JOIN_TIMEOUT_SECS)),
             is_store_host=False,
         )
+        handler._barrier_state._agent = MagicMock()
 
         with self.assertRaises(SignalException):
             handler.next_rendezvous()

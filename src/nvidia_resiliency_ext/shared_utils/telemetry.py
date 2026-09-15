@@ -30,6 +30,7 @@ from contextlib import ExitStack, contextmanager
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+_RUN_UUID = "nv.dl.run.uuid"
 
 #: Span groups NVRx emits, and the presets selecting them. nvrx.ckpt is one span
 #: per checkpoint request per side; nvrx.ckpt.phases breaks each into its stages
@@ -51,8 +52,7 @@ _PRESETS = {
 _INHERITED_RESOURCE_ATTRIBUTES = os.environ.get("OTEL_RESOURCE_ATTRIBUTES", "")
 
 try:
-    # Underscored names exist only when nemo-lens is installed. trace_fn's alias
-    # is the PEP 484 re-export form, marking a name this module never calls.
+    # Underscored imports exist only when nemo-lens is installed.
     #
     # OpenTelemetry is imported here, not where it is used, so that NVRx depends on
     # it in its own right rather than on nemo-lens continuing to pull it in. A
@@ -65,9 +65,14 @@ try:
     from nemo.lens import managed_span as _managed_span
     from nemo.lens import safe_set_span_attributes as _safe_set_span_attributes
     from nemo.lens import setup_telemetry as _setup_telemetry
-    from nemo.lens import trace_fn as trace_fn
+    from nemo.lens import span_attributes as _span_attributes
+    from nemo.lens import trace_fn
     from nemo.lens.resources import extend_otel_resource_attributes as _extend_resource_attributes
     from nemo.lens.resources import publish_otel_resource_attributes as _publish_resource_attributes
+    from nemo.lens.resources.attributes import (
+        parse_otel_resource_attributes as _parse_resource_attributes,
+    )
+    from nemo.lens.resources.slurm import derive_nv_dl_run_uuid as _derive_run_uuid
     from nemo.lens.span_utilities import emit_span as _emit_span
     from nemo.lens.span_utilities import linux_process_create_time as _process_create_time
     from opentelemetry import context as _otel_context
@@ -121,6 +126,8 @@ def setup_telemetry(
     service_name: str,
     instance_id: Optional[str] = None,
     resource_attributes: Optional[dict] = None,
+    *,
+    derive_run_uuid: bool = True,
 ):
     """Initialize nemo-lens. Call once, at process start, only in a process NVRx owns.
 
@@ -137,7 +144,8 @@ def setup_telemetry(
         config.service_name = service_name
         attributes = {"service.instance.id": instance_id} if instance_id else {}
         attributes.update(resource_attributes or {})
-        return _setup_telemetry(config, resource_attributes=attributes)
+        options = {} if derive_run_uuid else {"derive_run_uuid": False}
+        return _setup_telemetry(config, resource_attributes=attributes, **options)
     except Exception:
         logger.warning("nemo-lens init failed, continuing without telemetry", exc_info=True)
         return _NoOpHandle()
@@ -198,6 +206,17 @@ class ManualSpan:
         self._span = None
 
 
+def worker_run_attributes(restart_count: int, rendezvous_run_id: str) -> dict:
+    """Return the run UUID for this worker attempt."""
+    if not _AVAILABLE:
+        return {}
+    env = dict(os.environ)
+    env["TORCHELASTIC_RESTART_COUNT"] = str(restart_count)
+    env["TORCHELASTIC_RUN_ID"] = rendezvous_run_id
+    run_uuid = _derive_run_uuid(env, run_id=rendezvous_run_id)
+    return {_RUN_UUID: run_uuid} if run_uuid is not None else {}
+
+
 def span(group: str, name: str, attributes: Optional[dict] = None):
     """A span around a block, yielding it (or None when the group is off).
 
@@ -223,9 +242,15 @@ def _emit(
     if not _AVAILABLE or not _is_span_group_enabled(group):
         return None
     recorded = _emit_span(
-        _get_tracer(__name__), name, start, end, context=context, attributes=attributes or {}
+        _get_tracer(__name__),
+        name,
+        start,
+        end,
+        group=group,
+        context=context,
+        attributes=attributes,
     )
-    return recorded.get_span_context()
+    return recorded.get_span_context() if recorded is not None else None
 
 
 def backdated_span(
@@ -235,14 +260,16 @@ def backdated_span(
     end: Optional[float],
     attributes: Optional[dict] = None,
     parent=None,
-) -> None:
+):
     """Record a span for a window that elapsed before there was a tracer.
 
     ``start`` and ``end`` are wall-clock seconds; ``parent`` is usually the
     ``SpanContext`` of the ``mark`` that opened the window, and without one the span
-    roots its own trace. A no-op unless the window is a positive interval.
+    starts a new trace. Lens validates timestamps, checks whether the group is
+    enabled, and ends the span. Zero duration is valid. Return the recorded span's
+    context, or None if no span was recorded.
     """
-    if start is None or end is None or end <= start:
+    if start is None or end is None:
         return
     if not _AVAILABLE or not _is_span_group_enabled(group):
         return
@@ -251,7 +278,7 @@ def backdated_span(
     context = _otel_context.Context()
     if parent is not None:
         context = _otel_trace.set_span_in_context(_otel_trace.NonRecordingSpan(parent), context)
-    _emit(group, name, start, end, attributes, context)
+    return _emit(group, name, start, end, attributes, context)
 
 
 def mark(group: str, name: str, attributes: Optional[dict] = None):
@@ -261,6 +288,8 @@ def mark(group: str, name: str, attributes: Optional[dict] = None):
     immediately, so the context outlives it -- ids, not a handle to anything live.
     Inherits the ambient span, so a mark nests where an ordinary span would.
     """
+    if not _AVAILABLE or not _is_span_group_enabled(group):
+        return None
     now = time.time()
     return _emit(group, name, now, now, attributes)
 
@@ -272,34 +301,64 @@ def set_span_attributes(attributes: dict) -> None:
     _safe_set_span_attributes(_otel_trace.get_current_span(), attributes)
 
 
-def extended_resource_attributes(attributes: dict) -> str:
-    """Extend the inherited ``OTEL_RESOURCE_ATTRIBUTES`` with more pairs.
+def extended_resource_attributes(
+    attributes: dict, *, use_current: bool = False, fill_missing: Optional[dict] = None
+) -> str:
+    """Return an ``OTEL_RESOURCE_ATTRIBUTES`` string with the supplied attributes.
 
-    NVRx never parses the variable -- it is an opaque string to extend. Extending is
-    always from the value inherited at start, never from the last extension, or a
-    relaunched cohort accumulates a key per cycle. ``overwrite`` because an NVRx key
-    already in the inherited value is stale: this process is the authority on it.
-    Returns the inherited value unchanged when nemo-lens is absent: NVRx emits no
-    telemetry then, so it has nothing to say about this process.
+    By default, start from the value saved when this module was imported. This
+    prevents later environment changes from affecting subsequent worker launches.
+    Set ``use_current=True`` to include attributes published since import, such as
+    the trainer's attributes when starting a checkpoint worker.
+
+    ``fill_missing`` supplies values for missing or empty attributes. Values in
+    ``attributes`` replace existing values. Lens parses and formats the string.
+    Without Lens, return the selected string unchanged.
     """
+    key = "OTEL_RESOURCE_ATTRIBUTES"
+    base = os.environ.get(key, "") if use_current else _INHERITED_RESOURCE_ATTRIBUTES
     if not _AVAILABLE:
-        return _INHERITED_RESOURCE_ATTRIBUTES
-    return _extend_resource_attributes(_INHERITED_RESOURCE_ATTRIBUTES, attributes, overwrite=True)
+        return base
+    if fill_missing:
+        # Use defaults for missing or empty values.
+        # Keep existing nonempty values, even if malformed.
+        empty_defaults = {
+            name
+            for name, value in _parse_resource_attributes(base).items()
+            if name in fill_missing and value == ""
+        }
+        base = _extend_resource_attributes(
+            base, fill_missing, overwrite=False, exclude=empty_defaults
+        )
+    return _extend_resource_attributes(base, attributes, overwrite=True)
 
 
 @contextmanager
-def publish_resource_attributes(attributes: dict):
-    """Publish attributes into the environment, for a child spawned inside.
+def publish_resource_attributes(
+    attributes: dict, *, use_current: bool = False, fill_missing: Optional[dict] = None
+):
+    """Temporarily set environment attributes for a child process.
 
-    ``multiprocessing.Process`` has no ``env``, so the environment at ``start()``
-    is the only channel to a spawned child. Wrap that call. nemo-lens restores the
-    previous value on the way out, including on error -- left set, it would describe
-    this process and every later child of it. Values arrive in the child as strings.
+    Call ``multiprocessing.Process.start()`` inside this scope so the child
+    inherits the selected attributes. The arguments have the same meaning as in
+    ``extended_resource_attributes``. Lens restores the previous environment value
+    when the scope exits, including on error. Without Lens, leave the environment
+    unchanged.
     """
     if not _AVAILABLE:
         yield
         return
-    with _publish_resource_attributes(attributes, overwrite=True):
+    carrier = extended_resource_attributes(
+        attributes, use_current=use_current, fill_missing=fill_missing
+    )
+    # Replace the current environment attributes with the selected attributes.
+    # When using the import-time values, omit attributes added since import.
+    # Lens restores the previous environment when this scope exits.
+    with _publish_resource_attributes(
+        _parse_resource_attributes(carrier),
+        overwrite=True,
+        exclude=_parse_resource_attributes(os.environ.get("OTEL_RESOURCE_ATTRIBUTES", "")),
+    ):
         yield
 
 
@@ -349,8 +408,11 @@ class Phase:
         self._parent = None
         self._token = None
         self._attributes: dict = {}
+        self._scopes = ExitStack()
 
-    def open(self, group: str, name: str, attributes: Optional[dict] = None) -> None:
+    def open(
+        self, group: str, name: str, attributes: Optional[dict] = None, *, scoped_attributes=None
+    ) -> None:
         """Mark the start of the phase, closing any phase this handle had open."""
         # Without nemo-lens nothing downstream can record anything, so leave _start
         # unset: that is the flag set() and close() already bail on, which makes the
@@ -363,7 +425,14 @@ class Phase:
         # Seeded, not emptied: a consumer filtering spans never sees the mark's
         # attributes, so a key left only there cannot be grouped on.
         self._attributes = dict(attributes or {})
-        self._parent = mark(group, f"{name}_start", attributes)
+        try:
+            if scoped_attributes and _is_span_group_enabled(group):
+                self._scopes.enter_context(_span_attributes(scoped_attributes))
+            self._parent = mark(group, f"{name}_start", attributes)
+        except BaseException:
+            self._start = None
+            self._scopes.close()
+            raise
         if self._parent is None:  # group off; the phase still spans nothing to nest in
             return
         try:
@@ -374,11 +443,14 @@ class Phase:
             # Losing the ambient context costs nesting, not spans.
             logger.debug("Could not make %s the active context", self._name, exc_info=True)
 
-    def set(self, attributes: Optional[dict] = None) -> None:
-        """Record attributes to be emitted on the backdated span at close."""
-        if self._start is None or not attributes:
+    def set(self, attributes: Optional[dict] = None, *, scoped_attributes=None) -> None:
+        """Update the phase summary and optionally scope attributes for new spans."""
+        if self._start is None:
             return
-        self._attributes.update(attributes)
+        if attributes:
+            self._attributes.update(attributes)
+        if scoped_attributes and _is_span_group_enabled(self._group):
+            self._scopes.enter_context(_span_attributes(scoped_attributes))
 
     def close(self, attributes: Optional[dict] = None) -> None:
         """Emit the backdated span covering the phase. Idempotent."""
@@ -394,13 +466,16 @@ class Phase:
                 # the stale ambient context.
                 logger.debug("Out-of-order close for phase %s", self._name, exc_info=True)
             self._token = None
-        backdated_span(
-            self._group,
-            self._name,
-            self._start,
-            time.time(),
-            self._attributes,
-            parent=self._parent,
-        )
-        self._group = self._name = self._start = self._parent = None
-        self._attributes = {}
+        try:
+            backdated_span(
+                self._group,
+                self._name,
+                self._start,
+                time.time(),
+                self._attributes,
+                parent=self._parent,
+            )
+        finally:
+            self._group = self._name = self._start = self._parent = None
+            self._attributes = {}
+            self._scopes.close()
