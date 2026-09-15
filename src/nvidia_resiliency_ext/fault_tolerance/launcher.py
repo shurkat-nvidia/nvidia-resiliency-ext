@@ -598,11 +598,14 @@ class LocalElasticAgent(SimpleElasticAgent):
             shutdown_called = True
             raise
         finally:
-            if not shutdown_called:
-                self._shutdown()
-            # record the execution time in case there were any exceptions during run.
-            self._total_execution_time = int(time.monotonic() - start_time)
-            telemetry.shutdown(self._tel_handle)
+            try:
+                if not shutdown_called:
+                    self._shutdown()
+            finally:
+                self._run_phase.close()
+                self._cycle_phase.close()
+                self._total_execution_time = int(time.monotonic() - start_time)
+                telemetry.shutdown(self._tel_handle)
 
     def _open_rendezvous_for_restart(self):
         """Open rendezvous for restart when using barrier-based rendezvous.
